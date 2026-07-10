@@ -68,6 +68,66 @@ static int path_contains(const fanet_packet_t *p, uint8_t id) {
     return 0;
 }
 
+/* ---- reverse-path memory (for sending RREP back) ------------------------ */
+
+/* Remember: for this req_id, the RREP should go back to `prev`. */
+static void remember_reverse(fanet_node_t *n, uint16_t req_id, uint8_t prev) {
+    /* update if we already have this req_id */
+    for (uint8_t i = 0; i < n->rev_count; ++i) {
+        if (n->rev_req[i] == req_id) { n->rev_prev[i] = prev; return; }
+    }
+    if (n->rev_count < FANET_REQ_CACHE) {
+        n->rev_req[n->rev_count]  = req_id;
+        n->rev_prev[n->rev_count] = prev;
+        n->rev_count++;
+    }
+}
+
+/* Look up who to send the RREP back to for this req_id.
+ * (Currently the RREP walks the path array directly; this reverse lookup is
+ * kept for a future pure-reverse-path variant that doesn't carry the path.) */
+
+/* ---- routing table ------------------------------------------------------ */
+
+/* Install/update a route: to reach dst, go via next_hop (hops away). */
+static void install_route(fanet_node_t *n, uint8_t dst,
+                          uint8_t next_hop, uint8_t hops) {
+    /* update existing entry for dst if present */
+    for (int i = 0; i < FANET_ROUTE_TABLE; ++i) {
+        if (n->routes[i].valid && n->routes[i].dst == dst) {
+            /* keep the shorter route */
+            if (hops < n->routes[i].hops) {
+                n->routes[i].next_hop = next_hop;
+                n->routes[i].hops = hops;
+            }
+            return;
+        }
+    }
+    /* find a free slot */
+    for (int i = 0; i < FANET_ROUTE_TABLE; ++i) {
+        if (!n->routes[i].valid) {
+            n->routes[i].dst = dst;
+            n->routes[i].next_hop = next_hop;
+            n->routes[i].hops = hops;
+            n->routes[i].valid = 1;
+            return;
+        }
+    }
+    /* table full: overwrite slot 0 (simple policy for MCU) */
+    n->routes[0].dst = dst;
+    n->routes[0].next_hop = next_hop;
+    n->routes[0].hops = hops;
+    n->routes[0].valid = 1;
+}
+
+uint8_t fanet_next_hop(const fanet_node_t *n, uint8_t dst) {
+    for (int i = 0; i < FANET_ROUTE_TABLE; ++i) {
+        if (n->routes[i].valid && n->routes[i].dst == dst)
+            return n->routes[i].next_hop;
+    }
+    return FANET_INVALID_ID;
+}
+
 /* ---- public API --------------------------------------------------------- */
 
 void fanet_node_init(fanet_node_t *n, uint8_t id, float x, float y,
@@ -86,6 +146,7 @@ void fanet_node_set_metrics(fanet_node_t *n, fanet_metrics_t m) {
 
 void fanet_node_reset_cache(fanet_node_t *n) {
     n->seen_count = 0;
+    n->rev_count = 0;
     n->route_complete = 0;
     n->found_len = 0;
 }
@@ -111,56 +172,139 @@ static float score_sender(const fanet_node_t *self,
     return score;
 }
 
-void fanet_node_on_receive(fanet_node_t *n, const fanet_packet_t *pkt) {
-    /* --- loop / duplicate guard --- */
-    if (seen_before(n, pkt->req_id) || path_contains(pkt, n->id))
-        return;
-    remember(n, pkt->req_id);
+/* ---- RREP: build and send a reply back toward the source --------------- */
 
-    /* --- am I the destination? --- */
-    if (n->id == pkt->dst) {
-        /* record the full path: existing path + me */
+/*
+ * Called at the destination when an RREQ arrives. Emits an RREP that will
+ * travel back along the recorded reverse path to the source. The full path
+ * (source..dest) is carried so every hop can populate its routing table and
+ * the source can capture the complete route.
+ */
+static void send_rrep(fanet_node_t *n, const fanet_packet_t *rreq) {
+    fanet_packet_t rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.type    = PKT_RREP;
+    rep.src     = rreq->src;    /* original source (final RREP recipient) */
+    rep.dst     = rreq->dst;    /* the destination (me) */
+    rep.req_id  = rreq->req_id;
+    rep.ttl     = 15;
+
+    /* copy the full forward path (source..me) into the RREP */
+    uint8_t len = rreq->path_len;
+    if (len > FANET_MAX_PATH - 1) len = FANET_MAX_PATH - 1;
+    memcpy(rep.path, rreq->path, len);
+    rep.path[len] = n->id;            /* append destination */
+    rep.path_len  = (uint8_t)(len + 1);
+
+    /* also record my own route back to the source (reverse direction),
+     * so the destination can reply to future data. next hop = previous node */
+    uint8_t prev = (rreq->path_len > 0)
+                 ? rreq->path[rreq->path_len - 1] : rreq->src;
+    install_route(n, rreq->src, prev, rreq->path_len);
+
+    /* unicast the RREP to the previous hop on the path */
+    n->transport->send(n, prev, &rep);
+}
+
+/*
+ * Handle an RREP travelling back toward the source. Each node:
+ *   - installs a forward route (to the destination via the next node
+ *     toward the destination on the path),
+ *   - if it's the source, captures the completed route,
+ *   - otherwise forwards the RREP one hop further back.
+ */
+static void handle_rrep(fanet_node_t *n, const fanet_packet_t *pkt) {
+    /* locate my position in the path */
+    int my_idx = -1;
+    for (uint8_t i = 0; i < pkt->path_len; ++i) {
+        if (pkt->path[i] == n->id) { my_idx = (int)i; break; }
+    }
+    if (my_idx < 0) return;   /* RREP not meant for me / not on this path */
+
+    /* install forward route toward the destination: the next node on the
+     * path (closer to dst) is my next hop; hops = distance from me to dst. */
+    if (my_idx + 1 < pkt->path_len) {
+        uint8_t next = pkt->path[my_idx + 1];
+        uint8_t hops = (uint8_t)(pkt->path_len - 1 - my_idx);
+        install_route(n, pkt->dst, next, hops);
+    }
+
+    /* am I the source? then the route discovery is complete. */
+    if (n->id == pkt->src) {
         uint8_t len = pkt->path_len;
-        if (len > FANET_MAX_PATH - 1) len = FANET_MAX_PATH - 1;
+        if (len > FANET_MAX_PATH) len = FANET_MAX_PATH;
         memcpy(n->found_path, pkt->path, len);
-        n->found_path[len] = n->id;
-        n->found_len = (uint8_t)(len + 1);
+        n->found_len = len;
         n->route_complete = 1;
         return;
     }
 
-    /* --- TTL --- */
+    /* otherwise forward the RREP one more hop back toward the source:
+     * the previous node on the path is closer to the source. */
+    if (my_idx - 1 >= 0) {
+        uint8_t prev = pkt->path[my_idx - 1];
+        fanet_packet_t fwd = *pkt;
+        if (fwd.ttl > 0) fwd.ttl--;
+        n->transport->send(n, prev, &fwd);
+    }
+}
+
+/* ---- RREQ handling ------------------------------------------------------ */
+
+static void handle_rreq(fanet_node_t *n, const fanet_packet_t *pkt) {
+    /* loop / duplicate guard */
+    if (seen_before(n, pkt->req_id) || path_contains(pkt, n->id))
+        return;
+    remember(n, pkt->req_id);
+
+    /* remember who to send an RREP back to for this request */
+    uint8_t prev = (pkt->path_len > 0)
+                 ? pkt->path[pkt->path_len - 1] : pkt->src;
+    remember_reverse(n, pkt->req_id, prev);
+
+    /* am I the destination? -> reply with RREP instead of storing locally */
+    if (n->id == pkt->dst) {
+        send_rrep(n, pkt);
+        return;
+    }
+
+    /* TTL */
     if (pkt->ttl == 0) return;
 
-    /* --- decide whether to forward, based on the SENDER's trust ---
-     * The sender is the last node on the path. In FUZZY mode we score the
-     * sender's metrics and additionally apply a trust filter: a known
-     * malicious node is forced to score 0 (as the Trust Manager does in
-     * RoutingProtocol.m).
-     *
-     * Sim detail: a Black Hole advertises perfect metrics, so fuzzy scoring
-     * alone can't catch it. The virtual network signals ground-truth
-     * maliciousness out-of-band via a sentinel (snr_db == 127) that a real
-     * trust/reputation system would replace with actual behavioral evidence.
-     * On hardware, swap this sentinel check for real TrustManager state. */
+    /* trust/reliability gate on the sender (see note below) */
     uint8_t sender_malicious = (pkt->sender.snr_db == 127);
-
     float score = score_sender(n, pkt, sender_malicious);
     if (score < FANET_FORWARD_THRESHOLD)
         return;   /* drop: sender not trustworthy/reliable enough */
 
-    /* --- relay: append self, decrement TTL, rebroadcast --- */
+    /* relay: append self, decrement TTL, rebroadcast */
     fanet_packet_t fwd = *pkt;
     if (fwd.path_len < FANET_MAX_PATH) {
         fwd.path[fwd.path_len++] = n->id;
     }
     fwd.ttl = (uint8_t)(pkt->ttl - 1);
-
-    /* carry MY metrics so the next hop can score me */
     fwd.sender = n->metrics;
     if (n->is_malicious) fwd.sender.snr_db = 127;  /* sentinel for sim */
 
     n->transport->send(n, FANET_INVALID_ID, &fwd);
+}
+
+/*
+ * Transport entry point. Dispatches by packet type.
+ *
+ * Trust-filter note: the sender is the last node on the path. In FUZZY mode
+ * we score its metrics; a known malicious node is forced to score 0 (as the
+ * Trust Manager does in RoutingProtocol.m). In the sim, a Black Hole
+ * advertises perfect metrics, so ground-truth maliciousness is signalled
+ * out-of-band via a sentinel (snr_db == 127). On hardware, replace that
+ * sentinel with real TrustManager state.
+ */
+void fanet_node_on_receive(fanet_node_t *n, const fanet_packet_t *pkt) {
+    switch (pkt->type) {
+        case PKT_RREQ: handle_rreq(n, pkt); break;
+        case PKT_RREP: handle_rrep(n, pkt); break;
+        default: break;   /* HELLO / DATA handled elsewhere */
+    }
 }
 
 void fanet_start_discovery(fanet_node_t *n, uint8_t dst) {

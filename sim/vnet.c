@@ -55,16 +55,32 @@ static void q_push(fanet_node_t *to, const fanet_packet_t *pkt) {
     g_vnet.qtail = next;
 }
 
+/*
+ * Deliver a packet. If dst == FANET_INVALID_ID: broadcast to all in-range
+ * neighbors (used by RREQ flood) - lossy, models fading/collisions on a
+ * shared broadcast frame. Otherwise: unicast to that specific in-range node
+ * (used by RREP) - reliable, because real unicast (ESP-NOW / addressed LoRa)
+ * carries link-layer ACK + retransmit, so a single fade doesn't drop it.
+ */
 static void vnet_send(fanet_node_t *self, uint8_t dst,
                       const fanet_packet_t *pkt) {
-    (void)dst;
+    int is_broadcast = (dst == FANET_INVALID_ID);
+
     for (int i = 0; i < g_vnet.count; ++i) {
         fanet_node_t *nb = g_vnet.nodes[i];
         if (nb == self) continue;
+        if (!is_broadcast && nb->id != dst) continue;   /* unicast target */
+
         float d = vdist(self, nb);
         if (d <= 0.0f || d > VNET_RANGE) continue;
-        float p_success = (d < VNET_RANGE * 0.7f) ? 0.98f : 0.70f;
-        if (vnet_rand() > p_success) continue;
+
+        if (is_broadcast) {
+            /* lossy shared medium */
+            float p_success = (d < VNET_RANGE * 0.7f) ? 0.98f : 0.70f;
+            if (vnet_rand() > p_success) continue;
+        }
+        /* unicast: reliable (ACK+retransmit) -> always delivered in range */
+
         q_push(nb, pkt);
     }
 }

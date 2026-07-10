@@ -25,6 +25,22 @@ typedef enum {
 /* Remembered request ids, to drop duplicates and break loops. */
 #define FANET_REQ_CACHE 32
 
+/* Routing table size: how many destinations a node can remember a next-hop
+ * for. Small, since this targets microcontrollers. */
+#define FANET_ROUTE_TABLE 16
+
+/*
+ * One routing table entry: to reach `dst`, send to `next_hop`. Populated as
+ * an RREP travels back toward the source; this is what a node consults to
+ * forward DATA packets later.
+ */
+typedef struct {
+    uint8_t dst;        /* final destination id */
+    uint8_t next_hop;   /* neighbor to forward to */
+    uint8_t hops;       /* distance to dst (for tie-breaking) */
+    uint8_t valid;      /* entry in use? */
+} fanet_route_t;
+
 typedef struct fanet_node {
     uint8_t id;
     float   x, y;                 /* position (meters) */
@@ -37,8 +53,20 @@ typedef struct fanet_node {
     uint16_t seen_reqs[FANET_REQ_CACHE];
     uint8_t  seen_count;
 
-    /* result capture: when this node is the source and a route completes,
-     * the discovered path is copied here. */
+    /*
+     * Reverse-path memory: while an RREQ floods forward, each node records
+     * who it should send an RREP back to for a given request id. Keyed by
+     * req_id so concurrent discoveries don't collide.
+     */
+    uint16_t rev_req[FANET_REQ_CACHE];   /* req_id */
+    uint8_t  rev_prev[FANET_REQ_CACHE];  /* previous hop for that req_id */
+    uint8_t  rev_count;
+
+    /* Routing table: dst -> next_hop, filled by RREP on the way back. */
+    fanet_route_t routes[FANET_ROUTE_TABLE];
+
+    /* result capture: when this node is the source and the RREP arrives,
+     * the full discovered path is copied here and route_complete is set. */
     uint8_t  found_path[FANET_MAX_PATH];
     uint8_t  found_len;
     uint8_t  route_complete;
@@ -67,5 +95,12 @@ void fanet_start_discovery(fanet_node_t *n, uint8_t dst);
 
 /* Reset the duplicate cache (call before each fresh discovery in the sim). */
 void fanet_node_reset_cache(fanet_node_t *n);
+
+/*
+ * Look up the next hop toward `dst` in this node's routing table.
+ * Returns the next-hop id, or FANET_INVALID_ID if no route is known.
+ * This is what a DATA packet would consult to move one hop closer.
+ */
+uint8_t fanet_next_hop(const fanet_node_t *n, uint8_t dst);
 
 #endif /* FANET_ROUTING_H */

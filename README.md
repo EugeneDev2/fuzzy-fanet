@@ -30,8 +30,10 @@ Membership functions and all 27 rules transcribed directly from the original
 **Routing layer** (`src/fanet_routing.{c,h}`) — Fuzzy-AODV ported from the
 MATLAB `RoutingProtocol.m`: RREQ flooding, per-node metric normalization,
 fuzzy reliability scoring, the 0.4 forwarding gate, loop/duplicate protection,
-TTL, and a Black Hole trust filter. Talks only to a transport interface, so
-the same code runs over the PC sim today and ESP-NOW / LoRa later.
+TTL, a Black Hole trust filter, and **RREP** — the destination replies the
+route back to the source and every hop builds a routing table (`dst -> next
+hop`). Talks only to a transport interface, so the same code runs over the PC
+sim today and ESP-NOW / LoRa later.
 
 **Transport seam** (`src/fanet_transport.h`) — the one interface that lets the
 radio backend be swapped without touching routing.
@@ -58,14 +60,18 @@ opposite corners):
 === STANDARD AODV (blind) ===
   path: 0 -> 27(!) -> 21 -> 3 -> 8 -> 9(!) -> 28 -> 4 -> 49
   hops: 8 | attackers in route: 2   <<< BLACK HOLE IN PATH
+  routing table: node 0 -> next hop 27 toward 49 | node 49 -> next hop 4 toward 0
 
 === FUZZY AODV (trust filter) ===
   path: 0 -> 44 -> 7 -> 15 -> 29 -> 6 -> 25 -> 4 -> 49
   hops: 8 | attackers in route: 0   <<< route clean
+  routing table: node 0 -> next hop 44 toward 49 | node 49 -> next hop 4 toward 0
 ```
 
-`(!)` marks a Black Hole node. Standard AODV is lured through two attackers;
-Fuzzy-AODV routes around all of them.
+`(!)` marks a Black Hole node. Standard AODV is lured through two attackers
+and its routing table points straight at one (`next hop 27` = a Black Hole);
+Fuzzy-AODV routes around all of them. The RREP travels back from destination
+to source, so both ends end up with a next-hop route — ready to carry data.
 
 ## Use the fuzzy core directly
 
@@ -99,8 +105,12 @@ Still to do:
 - [x] Portable fuzzy core (matches MATLAB FIS)
 - [x] Fuzzy-AODV routing layer in C (RREQ flood, threshold, trust filter)
 - [x] PC virtual network + Black Hole experiment
-- [ ] **RREP**: reply the discovered route back to the source (right now the
-      path is recorded at the destination; a full AODV unicasts it back).
+- [x] **RREP**: the destination replies the discovered route back to the
+      source; every hop builds a routing table (dst -> next hop), so the
+      source knows who to send data to. Unicast RREP is modelled as reliable
+      (link-layer ACK), broadcast RREQ as lossy.
+- [ ] **DATA packets**: actually forward payload along the routing table the
+      RREP built, and measure end-to-end delivery (PDR).
 - [ ] **ESP32-C3 target**: flash the core, broadcast HELLO with live metrics
       over the radio (ESP-NOW first, LoRa later).
 - [ ] **Real TrustManager**: direct + indirect trust, watchlist/blacklist,

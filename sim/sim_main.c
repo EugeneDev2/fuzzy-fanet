@@ -78,33 +78,37 @@ static void run_mode(const char *label, fanet_mode_t mode) {
     fanet_node_t *dst = &nodes[N - 1];
 
     fanet_start_discovery(src, dst->id);
-    vnet_pump(dst->id);   /* drain flood until the DEST has a route */
+    vnet_pump(src->id);   /* drain until the SOURCE gets its RREP back */
 
-    /* In this RREQ-only model the discovered path is recorded at the
-     * destination (that's where the request arrives). A full AODV would
-     * RREP it back to the source; that's the next milestone. For now we
-     * read the result from the destination node. */
     printf("=== %s ===\n", label);
-    if (dst->found_len == 0) {
+    if (!src->route_complete || src->found_len == 0) {
         printf("  NO ROUTE FOUND (packet dropped / failsafe)\n\n");
         return;
     }
 
-    int hops = dst->found_len - 1;
+    int hops = src->found_len - 1;
     int attackers = 0;
     printf("  path: ");
-    for (int i = 0; i < dst->found_len; ++i) {
-        uint8_t id = dst->found_path[i];
+    for (int i = 0; i < src->found_len; ++i) {
+        uint8_t id = src->found_path[i];
         int bad = nodes[id].is_malicious;
         if (bad) attackers++;
         printf("%d%s", id, bad ? "(!)" : "");
-        if (i < dst->found_len - 1) printf(" -> ");
+        if (i < src->found_len - 1) printf(" -> ");
     }
     printf("\n  hops: %d | attackers in route: %d", hops, attackers);
     if (attackers > 0)
         printf("  <<< BLACK HOLE IN PATH\n");
     else
         printf("  <<< route clean\n");
+
+    /* proof that RREP built a routing table: source knows its next hop,
+     * and so does the destination (reverse route). */
+    uint8_t nh_fwd = fanet_next_hop(src, dst->id);
+    uint8_t nh_rev = fanet_next_hop(dst, src->id);
+    printf("  routing table: node %d -> next hop %d toward %d",
+           src->id, nh_fwd, dst->id);
+    printf(" | node %d -> next hop %d toward %d\n", dst->id, nh_rev, src->id);
     printf("\n");
 }
 
