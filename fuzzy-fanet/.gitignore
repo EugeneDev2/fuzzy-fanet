@@ -1,0 +1,9 @@
+# build artifacts
+test_fuzzy
+*.o
+*.out
+*.elf
+*.bin
+build/
+.pio/
+.vscode/
