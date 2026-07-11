@@ -81,6 +81,55 @@ int main(void) {
         check("unseen peer is not blacklisted", !ft_is_blacklisted(&t, 42));
     }
 
+    /* --- 6. more neighbours than the peer table can hold --- *
+     * The table has FT_MAX_PEERS slots. Overflowing it must degrade
+     * gracefully: no crash, peers tracked before it filled stay correct, and
+     * a peer that could NOT be tracked is never falsely accused. */
+    {
+        fanet_trust_t t;
+        ft_init(&t);
+
+        /* peer 0 is a Black Hole caught while there was still room */
+        for (int i = 0; i < 10; ++i) { ft_on_entrusted(&t, 0); ft_update(&t, 0); }
+
+        /* now flood the table with far more distinct peers than it can hold */
+        for (int p = 1; p <= FT_MAX_PEERS + 19; ++p) {
+            ft_on_entrusted(&t, (uint8_t)p);   /* many will hit a full table */
+            ft_update(&t, (uint8_t)p);
+        }
+        uint8_t overflow_peer = (uint8_t)(FT_MAX_PEERS + 19);  /* never fit */
+
+        check("black hole tracked before the table filled stays blacklisted",
+              ft_is_blacklisted(&t, 0));
+        check("untrackable overflow peer is not falsely blacklisted",
+              !ft_is_blacklisted(&t, overflow_peer));
+        check("untrackable overflow peer reads as neutral trust",
+              ft_trust_of(&t, overflow_peer) == FT_INITIAL);
+    }
+
+    /* --- 7. counter scaling must not corrupt a verdict --- *
+     * entrusted/forwarded are uint16_t and get halved at FT_EVIDENCE_CAP to
+     * avoid overflow. Correct scaling halves BOTH counters, so the ratio (and
+     * thus the verdict) is preserved. We push both a Black Hole and an honest
+     * relay well past the cap: a rescale that distorted the ratio - e.g.
+     * halving only one counter - would flip one of these verdicts. */
+    {
+        fanet_trust_t t;
+        ft_init(&t);
+        for (int i = 0; i < FT_EVIDENCE_CAP * 3; ++i) {
+            ft_on_entrusted(&t, 11);   /* handed thousands, never forwards */
+            ft_update(&t, 11);
+
+            ft_on_entrusted(&t, 12);   /* handed thousands, forwards them all */
+            ft_on_forwarded(&t, 12);
+            ft_update(&t, 12);
+        }
+        check("black hole stays blacklisted across counter rescaling",
+              ft_is_blacklisted(&t, 11));
+        check("honest relay stays trusted across counter rescaling",
+              !ft_is_blacklisted(&t, 12) && ft_status_of(&t, 12) == FT_OK);
+    }
+
     printf("\n%s\n", failures ? "SOME TESTS FAILED" : "all tests passed");
     return failures ? 1 : 0;
 }
