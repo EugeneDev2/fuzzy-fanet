@@ -53,6 +53,9 @@ make test    # unit-test the fuzzy core
 make sim     # run the Standard vs Fuzzy Black Hole experiment
 ```
 
+> **Windows:** build from PowerShell (with MSYS2 `make`/`gcc` in PATH), not
+> Git Bash — MSYS2 make conflicts with Git Bash's own `msys-2.0.dll`.
+
 Example simulation output (50 nodes, ~15% Black Holes, source & destination in
 opposite corners):
 
