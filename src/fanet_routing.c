@@ -138,36 +138,60 @@ void fanet_node_init(fanet_node_t *n, uint8_t id, float x, float y,
     n->y = y;
     n->mode = mode;
     n->transport = transport;
+    ft_init(&n->trust);
+    n->pending_peer = FANET_INVALID_ID;
 }
 
 void fanet_node_set_metrics(fanet_node_t *n, fanet_metrics_t m) {
     n->metrics = m;
 }
 
+/*
+ * Clear per-discovery state so a fresh route search starts clean.
+ *
+ * Note what is NOT cleared: the trust manager. Reputation is knowledge the
+ * node earned by watching its neighbours, and it must survive re-discovery -
+ * otherwise the network would forgive the attacker and walk straight back
+ * into it.
+ */
 void fanet_node_reset_cache(fanet_node_t *n) {
     n->seen_count = 0;
     n->rev_count = 0;
     n->route_complete = 0;
     n->found_len = 0;
+    memset(n->routes, 0, sizeof(n->routes));   /* stale routes must go */
 }
 
 /*
- * Score a candidate sender. Returns the fuzzy RouteScore, with the trust
- * filter applied in FUZZY mode (malicious nodes are forced to 0, exactly as
- * the Trust Manager does in RoutingProtocol.m).
+ * Score a candidate sender.
+ *
+ * In FUZZY mode the fuzzy controller rates the sender's advertised metrics,
+ * and then the TrustManager has the final say. Note the crucial point: a
+ * Black Hole ADVERTISES PERFECT METRICS, so fuzzy logic alone scores it
+ * highly - that is exactly how it lures traffic. Only observed behaviour
+ * exposes it. A blacklisted peer is therefore forced to zero regardless of
+ * how good it claims to look.
  */
 static float score_sender(const fanet_node_t *self,
-                          const fanet_packet_t *pkt,
-                          uint8_t sender_is_malicious) {
+                          const fanet_packet_t *pkt) {
     if (self->mode == MODE_STANDARD)
-        return 1.0f;   /* blind: always "good enough" */
+        return 1.0f;   /* blind: forwards for anyone, trusts every claim */
+
+    uint8_t sender = (pkt->path_len > 0)
+                   ? pkt->path[pkt->path_len - 1] : pkt->src;
+
+    /* Earned reputation overrides advertised quality. */
+    if (ft_is_blacklisted(&self->trust, sender))
+        return 0.0f;
 
     float nre, ns, nd;
     normalize_metrics(&pkt->sender, &nre, &ns, &nd);
     float score = ff_route_score(nre, ns, nd);
 
-    if (sender_is_malicious)
-        score = 0.0f;  /* trust filter: blacklist forces distrust */
+    /* A watchlisted peer is not banned outright, but its score is damped so
+     * an honest alternative wins. Suspicion, not conviction. */
+    if (ft_status_of(&self->trust, sender) == FT_WATCHED)
+        score *= 0.5f;
 
     return score;
 }
@@ -221,6 +245,19 @@ static void handle_rrep(fanet_node_t *n, const fanet_packet_t *pkt) {
     }
     if (my_idx < 0) return;   /* RREP not meant for me / not on this path */
 
+    /*
+     * Refuse a route that would hand traffic to a neighbour we have already
+     * caught swallowing packets. Discovery is blind to reputation - the RREQ
+     * may well have flooded through an attacker - so the reply is where we
+     * apply what we learned. Without this the network keeps rebuilding the
+     * same poisoned path.
+     */
+    if (my_idx + 1 < pkt->path_len) {
+        uint8_t next = pkt->path[my_idx + 1];
+        if (n->mode == MODE_FUZZY && ft_is_blacklisted(&n->trust, next))
+            return;   /* drop the reply: this path starts with a known thief */
+    }
+
     /* install forward route toward the destination: the next node on the
      * path (closer to dst) is my next hop; hops = distance from me to dst. */
     if (my_idx + 1 < pkt->path_len) {
@@ -271,9 +308,8 @@ static void handle_rreq(fanet_node_t *n, const fanet_packet_t *pkt) {
     /* TTL */
     if (pkt->ttl == 0) return;
 
-    /* trust/reliability gate on the sender (see note below) */
-    uint8_t sender_malicious = (pkt->sender.snr_db == 127);
-    float score = score_sender(n, pkt, sender_malicious);
+    /* Reliability + reputation gate on the sender. */
+    float score = score_sender(n, pkt);
     if (score < FANET_FORWARD_THRESHOLD)
         return;   /* drop: sender not trustworthy/reliable enough */
 
@@ -284,7 +320,6 @@ static void handle_rreq(fanet_node_t *n, const fanet_packet_t *pkt) {
     }
     fwd.ttl = (uint8_t)(pkt->ttl - 1);
     fwd.sender = n->metrics;
-    if (n->is_malicious) fwd.sender.snr_db = 127;  /* sentinel for sim */
 
     n->transport->send(n, FANET_INVALID_ID, &fwd);
 }
@@ -327,9 +362,57 @@ static void handle_data(fanet_node_t *n, const fanet_packet_t *pkt) {
         return;
     }
 
+    /* We are about to trust `next` to carry this onward. Arm an observation:
+     * if we never overhear it relaying THIS packet, that silence is what
+     * costs it reputation.
+     *
+     * Exception: if `next` IS the destination, it will consume the packet,
+     * not relay it. Expecting to overhear a forward would convict an honest
+     * endpoint of theft. */
+    if (next != pkt->dst) {
+        ft_on_entrusted(&n->trust, next);
+        ft_update(&n->trust, next);
+        n->pending_peer = next;
+        n->pending_dst  = pkt->dst;
+        n->pending_seq  = pkt->seq;
+    }
+
     fanet_packet_t fwd = *pkt;
     fwd.ttl = (uint8_t)(pkt->ttl - 1);
     n->transport->send(n, next, &fwd);
+}
+
+/*
+ * Promiscuous overhear: `listener` heard `transmitter` put a packet on the
+ * air. This only counts as evidence of good behaviour if it is the SAME
+ * packet the listener personally handed to that neighbour.
+ *
+ * Matching on the packet identity matters. A loose "I heard it transmit
+ * something" rule convicts honest nodes and acquits clever ones: a relay
+ * busy forwarding other people's traffic would get credit for packets it
+ * actually dropped. So we match on (destination, sequence number) - the
+ * pair that identifies the payload we entrusted.
+ *
+ * The absence of this call is what convicts a Black Hole: it accepts packets
+ * and is never heard relaying them, so `forwarded` stays flat while
+ * `entrusted` climbs, and its trust decays toward zero.
+ */
+void fanet_node_on_overhear(fanet_node_t *listener,
+                            uint8_t transmitter,
+                            const fanet_packet_t *pkt) {
+    if (listener->mode != MODE_FUZZY) return;   /* blind AODV doesn't watch */
+    if (pkt->type != PKT_DATA) return;          /* only payload matters here */
+    if (transmitter == listener->id) return;
+
+    /* Was this exact payload one we handed to this exact neighbour? */
+    if (listener->pending_peer != transmitter) return;
+    if (listener->pending_seq  != pkt->seq)    return;
+    if (listener->pending_dst  != pkt->dst)    return;
+
+    /* Yes - it kept its word. */
+    ft_on_forwarded(&listener->trust, transmitter);
+    ft_update(&listener->trust, transmitter);
+    listener->pending_peer = FANET_INVALID_ID;   /* resolved */
 }
 
 int fanet_send_data(fanet_node_t *n, uint8_t dst,
@@ -349,6 +432,16 @@ int fanet_send_data(fanet_node_t *n, uint8_t dst,
     if (len > FANET_PAYLOAD) len = FANET_PAYLOAD;
     if (payload && len) memcpy(pkt.payload, payload, len);
 
+    /* the source trusts its first hop just like any relay does - unless that
+     * hop is the destination itself, which consumes rather than relays */
+    if (next != dst) {
+        ft_on_entrusted(&n->trust, next);
+        ft_update(&n->trust, next);
+        n->pending_peer = next;
+        n->pending_dst  = dst;
+        n->pending_seq  = seq;
+    }
+
     n->data_sent++;
     n->transport->send(n, next, &pkt);
     return 1;
@@ -357,12 +450,9 @@ int fanet_send_data(fanet_node_t *n, uint8_t dst,
 /*
  * Transport entry point. Dispatches by packet type.
  *
- * Trust-filter note: the sender is the last node on the path. In FUZZY mode
- * we score its metrics; a known malicious node is forced to score 0 (as the
- * Trust Manager does in RoutingProtocol.m). In the sim, a Black Hole
- * advertises perfect metrics, so ground-truth maliciousness is signalled
- * out-of-band via a sentinel (snr_db == 127). On hardware, replace that
- * sentinel with real TrustManager state.
+ * Trust is no longer faked. Nothing here knows who is "really" malicious:
+ * a node's reputation is earned or lost purely through observed forwarding
+ * behaviour (see fanet_trust.h and fanet_node_on_overhear).
  */
 void fanet_node_on_receive(fanet_node_t *n, const fanet_packet_t *pkt) {
     switch (pkt->type) {
@@ -385,7 +475,6 @@ void fanet_start_discovery(fanet_node_t *n, uint8_t dst) {
     pkt.path[0] = n->id;
     pkt.path_len = 1;
     pkt.sender = n->metrics;
-    if (n->is_malicious) pkt.sender.snr_db = 127;
 
     n->route_complete = 0;
     n->found_len = 0;

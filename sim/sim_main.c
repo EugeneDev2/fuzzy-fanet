@@ -70,64 +70,124 @@ static void build_topology(fanet_mode_t mode) {
     }
 }
 
+/*
+ * Push a burst of payloads along whatever route currently exists, and report.
+ * Returns packets delivered.
+ */
+static int push_data(fanet_node_t *src, fanet_node_t *dst, int burst,
+                     uint16_t seq_base, int *refused_out) {
+    const uint8_t payload[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    int refused = 0;
+    int before = dst->data_received;
+
+    for (int i = 0; i < burst; ++i) {
+        if (!fanet_send_data(src, dst->id, payload, 4,
+                             (uint16_t)(seq_base + i)))
+            refused++;
+        vnet_pump(FANET_INVALID_ID);
+    }
+    if (refused_out) *refused_out = refused;
+    return dst->data_received - before;
+}
+
+static int count_attackers(const uint8_t *path, uint8_t len) {
+    int a = 0;
+    for (uint8_t i = 0; i < len; ++i)
+        if (nodes[path[i]].is_malicious) a++;
+    return a;
+}
+
+static void print_path(const uint8_t *path, uint8_t len) {
+    for (uint8_t i = 0; i < len; ++i) {
+        printf("%d%s", path[i], nodes[path[i]].is_malicious ? "(!)" : "");
+        if (i < len - 1) printf(" -> ");
+    }
+}
+
+static int count_bad(void) {
+    int b = 0;
+    for (int i = 0; i < N; ++i) if (nodes[i].is_malicious) b++;
+    return b;
+}
+
+static int count_detected(void) {
+    int d = 0;
+    for (int j = 0; j < N; ++j) {
+        if (!nodes[j].is_malicious) continue;
+        for (int i = 0; i < N; ++i)
+            if (ft_is_blacklisted(&nodes[i].trust, (uint8_t)j)) { d++; break; }
+    }
+    return d;
+}
+
+static int count_false_accusations(void) {
+    int f = 0;
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            if (!nodes[j].is_malicious &&
+                ft_is_blacklisted(&nodes[i].trust, (uint8_t)j)) f++;
+    return f;
+}
+
 static void run_mode(const char *label, fanet_mode_t mode) {
     build_topology(mode);
-    vnet_clear_caches();
 
     fanet_node_t *src = &nodes[0];
     fanet_node_t *dst = &nodes[N - 1];
-
-    fanet_start_discovery(src, dst->id);
-    vnet_pump(src->id);   /* drain until the SOURCE gets its RREP back */
+    const int BURST = 100;
+    const int MAX_ROUNDS = 6;
 
     printf("=== %s ===\n", label);
-    if (!src->route_complete || src->found_len == 0) {
-        printf("  NO ROUTE FOUND (packet dropped / failsafe)\n\n");
-        return;
+
+    for (int round = 1; round <= MAX_ROUNDS; ++round) {
+        vnet_clear_caches();
+        fanet_start_discovery(src, dst->id);
+        vnet_pump(FANET_INVALID_ID);
+
+        if (!src->route_complete || src->found_len == 0) {
+            printf("  round %d: NO ROUTE - fail-safe, refuses to feed "
+                   "distrusted nodes\n", round);
+            break;
+        }
+
+        int att = count_attackers(src->found_path, src->found_len);
+        int refused = 0;
+        int got = push_data(src, dst, BURST, (uint16_t)(round * 1000), &refused);
+
+        printf("  round %d: ", round);
+        print_path(src->found_path, src->found_len);
+        printf("\n           attackers on path: %d | PDR %.0f%%",
+               att, 100.0f * got / BURST);
+
+        if (mode == MODE_FUZZY) {
+            int det = count_detected();
+            printf(" | blacklisted so far: %d", det);
+        }
+        printf("\n");
+
+        /* blind AODV never learns - one round is the whole story */
+        if (mode == MODE_STANDARD) {
+            printf("           blind AODV cannot learn: it will keep "
+                   "feeding the attacker forever.\n");
+            break;
+        }
+
+        /* converged: clean route carrying data */
+        if (att == 0 && got > 0) {
+            printf("           CONVERGED - route is clean, data flowing.\n");
+            break;
+        }
     }
 
-    int hops = src->found_len - 1;
-    int attackers = 0;
-    printf("  path: ");
-    for (int i = 0; i < src->found_len; ++i) {
-        uint8_t id = src->found_path[i];
-        int bad = nodes[id].is_malicious;
-        if (bad) attackers++;
-        printf("%d%s", id, bad ? "(!)" : "");
-        if (i < src->found_len - 1) printf(" -> ");
+    if (mode == MODE_FUZZY) {
+        int fp = count_false_accusations();
+        printf("  detection: %d/%d attackers unmasked purely by watching "
+               "who failed to forward", count_detected(), count_bad());
+        if (fp) printf(" | %d false accusation(s)", fp);
+        else    printf(" | no honest node was wrongly accused");
+        printf("\n");
     }
-    printf("\n  hops: %d | attackers in route: %d", hops, attackers);
-    if (attackers > 0)
-        printf("  <<< BLACK HOLE IN PATH\n");
-    else
-        printf("  <<< route clean\n");
-
-    /* --- now actually push data along the route the RREP built --- */
-    const int BURST = 100;
-    const uint8_t payload[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
-    int refused = 0;
-
-    for (int i = 0; i < BURST; ++i) {
-        if (!fanet_send_data(src, dst->id, payload, 4, (uint16_t)i))
-            refused++;          /* fail-safe: source had no route */
-        vnet_pump(FANET_INVALID_ID);   /* deliver until the network settles */
-    }
-
-    int delivered = dst->data_received;
-    float pdr = 100.0f * (float)delivered / (float)BURST;
-
-    /* where did the rest die? separate malice from physics. */
-    int swallowed = 0;
-    for (int i = 0; i < N; ++i)
-        if (nodes[i].is_malicious) swallowed += nodes[i].data_dropped;
-    int lost_radio = BURST - delivered - swallowed - refused;
-    if (lost_radio < 0) lost_radio = 0;
-
-    printf("  data: sent %d | delivered %d | PDR %.1f%%\n", BURST, delivered, pdr);
-    printf("  losses: %d swallowed by attackers | %d lost on radio",
-           swallowed, lost_radio);
-    if (refused) printf(" | %d refused (no route)", refused);
-    printf("\n\n");
+    printf("\n");
 }
 
 int main(void) {

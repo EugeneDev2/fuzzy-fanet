@@ -11,6 +11,7 @@
 
 #include "fanet_types.h"
 #include "fanet_transport.h"
+#include "fanet_trust.h"
 
 /* Forwarding threshold: a node relays an RREQ only if the sender's fuzzy
  * RouteScore is at least this. Matches the 0.4 gate in RoutingProtocol.m. */
@@ -76,6 +77,16 @@ typedef struct fanet_node {
     uint16_t data_received;  /* payloads that arrived here as final dest */
     uint16_t data_dropped;   /* payloads this node deliberately swallowed
                               * (Black Hole) or had to discard (no route) */
+
+    /* --- reputation of neighbours, learned from their behaviour --- */
+    fanet_trust_t trust;
+
+    /* The packet we most recently handed to a neighbour and are now waiting
+     * to overhear it relay. Identified by (peer, dst, seq) so that only a
+     * genuine forward of THAT packet counts as evidence of good behaviour. */
+    uint8_t  pending_peer;   /* FANET_INVALID_ID when nothing is pending */
+    uint8_t  pending_dst;
+    uint16_t pending_seq;
 } fanet_node_t;
 
 /* Initialize a node. */
@@ -118,5 +129,20 @@ uint8_t fanet_next_hop(const fanet_node_t *n, uint8_t dst);
  */
 int fanet_send_data(fanet_node_t *n, uint8_t dst,
                     const uint8_t *payload, uint8_t len, uint16_t seq);
+
+/*
+ * Promiscuous overhear hook.
+ *
+ * Radio is a broadcast medium: when a neighbour transmits, everyone in range
+ * hears it, whether or not they are the addressee. The transport calls this
+ * on every node within earshot of a transmission, so a node can verify that
+ * a neighbour it trusted actually re-transmitted the packet it was given.
+ *
+ * This is what turns trust from a hardcoded flag into something OBSERVED.
+ * A Black Hole is caught because the silence after it is heard.
+ */
+void fanet_node_on_overhear(fanet_node_t *listener,
+                            uint8_t transmitter,
+                            const fanet_packet_t *pkt);
 
 #endif /* FANET_ROUTING_H */

@@ -35,6 +35,12 @@ back, and every hop builds a `dst -> next hop` table), and **DATA** forwarding
 along that table with PDR accounting. Talks only to a transport interface, so
 the same code runs over the PC sim today and ESP-NOW / LoRa later.
 
+**Trust manager** (`src/fanet_trust.{c,h}`) — behavioural Black Hole detection.
+Tracks, per neighbour, how many packets it was entrusted with versus how many
+it was actually overheard forwarding, smooths that into a reputation, and
+watchlists then blacklists nodes that swallow traffic. No node is ever told
+who the attackers are — it works it out. Portable C99, no allocation.
+
 **Transport seam** (`src/fanet_transport.h`) — the one interface that lets the
 radio backend be swapped without touching routing.
 
@@ -49,7 +55,7 @@ MATLAB `evalfis` reference (e.g. R25: 0.92/0.88/0.12 → ~0.90).
 ## Build & run (desktop, no hardware)
 
 ```sh
-make test    # unit-test the fuzzy core
+make test    # unit-test the fuzzy core and the trust manager
 make sim     # run the Standard vs Fuzzy Black Hole experiment
 ```
 
@@ -61,25 +67,58 @@ opposite corners):
 
 ```
 === STANDARD AODV (blind) ===
-  path: 0 -> 27(!) -> 21 -> 3 -> 8 -> 9(!) -> 28 -> 4 -> 49
-  hops: 8 | attackers in route: 2   <<< BLACK HOLE IN PATH
-  data: sent 100 | delivered 0 | PDR 0.0%
-  losses: 97 swallowed by attackers | 3 lost on radio
+  round 1: 0 -> 27(!) -> 21 -> 3 -> 8 -> 9(!) -> 28 -> 4 -> 49
+           attackers on path: 2 | PDR 0%
+           blind AODV cannot learn: it will keep feeding the attacker forever.
 
 === FUZZY AODV (trust filter) ===
-  path: 0 -> 44 -> 7 -> 15 -> 29 -> 6 -> 25 -> 4 -> 49
-  hops: 8 | attackers in route: 0   <<< route clean
-  data: sent 100 | delivered 88 | PDR 88.0%
-  losses: 0 swallowed by attackers | 12 lost on radio
+  round 1: 0 -> 27(!) -> 21 -> 3 -> 8 -> 9(!) -> 28 -> 4 -> 49
+           attackers on path: 2 | PDR 0% | blacklisted so far: 1
+  round 2: 0 -> 31 -> 21 -> 3 -> 18 -> 9(!) -> 14 -> 4 -> 49
+           attackers on path: 1 | PDR 0% | blacklisted so far: 2
+  round 3: 0 -> 31 -> 5 -> 15 -> 29 -> 34 -> 41 -> 4 -> 49
+           attackers on path: 0 | PDR 87% | blacklisted so far: 2
+           CONVERGED - route is clean, data flowing.
+  detection: 2/6 attackers unmasked purely by watching who failed to forward
+             | no honest node was wrongly accused
 ```
 
-`(!)` marks a Black Hole. Standard AODV is lured through two attackers, and
-its very first hop swallows the traffic — **not a single payload arrives**.
-Fuzzy-AODV filters them out during discovery, so the route carries data: the
-only losses left are ordinary radio fades across 8 hops, not malice.
+`(!)` marks a Black Hole. Read the Fuzzy run as a story: the first route runs
+straight through two attackers and loses everything — **detection is reactive,
+not clairvoyant**. But the network watches, learns, and reroutes. By round 3
+the path is clean and data flows.
 
-That split matters. The protocol does not claim to beat physics — it claims
-to remove the attacker. The loss breakdown makes the difference explicit.
+**Nobody ever tells a node who the attackers are.** Each blacklist entry is
+earned: *"I handed you 100 packets and never once heard you relay them."*
+
+Note the honest numbers: only 2 of 6 attackers are unmasked, because the other
+4 were never on a route and therefore never stole anything. There is nothing
+to convict them of yet. A detector that magically flagged all 6 would be
+lying.
+
+## How the attacker is caught
+
+Radio is a broadcast medium, so a node can overhear whether the neighbour it
+just trusted actually relayed the packet. That gives direct trust:
+
+```
+T_direct = packets I overheard it forward / packets I entrusted to it
+```
+
+A Black Hole accepts everything and relays nothing, so its score collapses and
+it is blacklisted, then cut off entirely — the node refuses to even route
+requests through it (MAC-level isolation).
+
+Two details keep this honest rather than trigger-happy:
+
+- **Exponential smoothing** (α = 0.7): accumulated reputation outweighs any
+  single observation, so an honest relay that loses a packet to a radio fade
+  is forgiven. Verified in `test/test_trust.c`: a node forwarding 90% of
+  traffic keeps a trust of ~0.89 and is never blacklisted.
+- **Evidence threshold**: a neighbour must have been entrusted with several
+  packets before it can be condemned. One missed packet convicts nobody.
+
+The result: 0 false accusations in the run above.
 
 ## Use the fuzzy core directly
 
@@ -97,8 +136,9 @@ if (score >= 0.4f) {
 ```
 app / demo         (PC sim today; ESP32-C3 sketch later)
 transport adapter  (vnet on PC  ->  ESP-NOW / LoRa on hardware)   <- swap point
-routing (AODV)     RREQ/RREP, trust filter, threshold        [portable C]
-fuzzy core         NRE/NS/ND -> RouteScore                    [portable C] DONE
+routing (AODV)     RREQ/RREP/DATA, routing table              [portable C]
+trust manager      earned reputation, blacklist, isolation    [portable C]
+fuzzy core         NRE/NS/ND -> RouteScore                    [portable C]
 ```
 
 The golden rule: **the core never knows about the radio.** That is why the
@@ -121,12 +161,12 @@ Still to do:
       table the RREP built, and end-to-end delivery (PDR) is measured. A
       Black Hole now actually bites: it silently swallows every payload it is
       trusted to forward.
-- [ ] **Real TrustManager**: direct trust from observed behaviour — count how
-      many payloads a neighbour was given versus how many it actually
-      forwarded, decay its reputation, watchlist, then blacklist. This
-      replaces the sim's ground-truth sentinel with genuine detection.
-      *(Described in the thesis; never implemented in the original code,
-      which only had an `IsMalicious` flag.)*
+- [x] **Real TrustManager**: direct trust earned from observed forwarding
+      behaviour, exponential smoothing, watchlist → blacklist, and MAC-level
+      isolation of proven attackers. The ground-truth sentinel is gone: the
+      protocol no longer knows who is malicious, it finds out.
+      *(The thesis described this; the original MATLAB code never implemented
+      it — it just checked an `IsMalicious` flag.)*
 - [ ] **ESP32-C3 target**: flash the core, broadcast HELLO with live metrics
       over the radio (ESP-NOW first, LoRa later).
 - [ ] **Async simulation**: per-node timers / event loop instead of the
@@ -134,6 +174,16 @@ Still to do:
 - [ ] **Multi-hop swarm demo** on 3–5 boards + a short capture/video.
 - [ ] **Benchmarks**: decision latency, RAM, and how many RREQ broadcasts the
       fuzzy filter saves vs. vanilla AODV (the LoRa duty-cycle argument).
+
+### Deliberately not implemented
+
+The thesis also specifies indirect trust (reputation gossip between
+neighbours), ALARM broadcast packets, digital signatures, and a quarantine /
+rehabilitation cycle. Those are left out on purpose: they add substantial
+protocol surface and state for modest benefit at this scale, and indirect
+trust opens its own attack surface (bad-mouthing). Direct trust alone already
+identifies and isolates the attackers. Better an honest small system than a
+large one that only exists in the README.
 
 ## Origin & honesty note
 

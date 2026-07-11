@@ -67,6 +67,18 @@ static void q_push(fanet_node_t *to, const fanet_packet_t *pkt) {
  * edge of range. Modelling it as perfectly lossless would flatter the
  * protocol with an unrealistic 100% PDR.
  */
+/*
+ * Should `self` even talk to `peer`? A node that has caught a neighbour
+ * swallowing its traffic stops handing it anything at all - it will not even
+ * relay a route request through it. The thesis calls this MAC-level
+ * isolation: the attacker is cut out of the conversation, not merely scored
+ * badly. This is what stops the flood from rebuilding the same poisoned path.
+ */
+static int vnet_shunned(fanet_node_t *self, fanet_node_t *peer) {
+    return self->mode == MODE_FUZZY &&
+           ft_is_blacklisted(&self->trust, peer->id);
+}
+
 static void vnet_send(fanet_node_t *self, uint8_t dst,
                       const fanet_packet_t *pkt) {
     int is_broadcast = (dst == FANET_INVALID_ID);
@@ -74,10 +86,22 @@ static void vnet_send(fanet_node_t *self, uint8_t dst,
     for (int i = 0; i < g_vnet.count; ++i) {
         fanet_node_t *nb = g_vnet.nodes[i];
         if (nb == self) continue;
-        if (!is_broadcast && nb->id != dst) continue;   /* unicast target */
 
         float d = vdist(self, nb);
         if (d <= 0.0f || d > VNET_RANGE) continue;
+
+        /*
+         * Promiscuous overhearing. Radio is a shared medium: every node in
+         * range hears this transmission, addressed to them or not. That is
+         * what lets a node verify a neighbour actually relayed what it was
+         * given - and what exposes a Black Hole's silence.
+         */
+        fanet_node_on_overhear(nb, self->id, pkt);
+
+        /* isolation: never feed a node we have blacklisted */
+        if (vnet_shunned(self, nb)) continue;
+
+        if (!is_broadcast && nb->id != dst) continue;   /* unicast target */
 
         int near = (d < VNET_RANGE * 0.7f);
         float p_success = is_broadcast
