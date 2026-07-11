@@ -30,6 +30,23 @@ typedef enum {
  * for. Small, since this targets microcontrollers. */
 #define FANET_ROUTE_TABLE 16
 
+/* How many entrusted-but-not-yet-overheard observations a node can track at
+ * once. One slot is not enough: a node carrying several flows has several
+ * packets in flight, and a single slot would drop earlier observations and
+ * wrongly blame honest relays. */
+#define FANET_PENDING_MAX 8
+
+/*
+ * One outstanding observation: we handed `peer` a DATA packet identified by
+ * (dst, seq) and are waiting to overhear it relay that exact packet.
+ * peer == FANET_INVALID_ID marks an empty slot.
+ */
+typedef struct {
+    uint8_t  peer;
+    uint8_t  dst;
+    uint16_t seq;
+} fanet_pending_t;
+
 /*
  * One routing table entry: to reach `dst`, send to `next_hop`. Populated as
  * an RREP travels back toward the source; this is what a node consults to
@@ -51,17 +68,22 @@ typedef struct fanet_node {
     fanet_mode_t mode;
     fanet_transport_t *transport;
 
+    /* Duplicate/loop guard, kept as a ring buffer: when full, the oldest
+     * req_id is overwritten rather than dropped, so loop protection keeps
+     * working past the first FANET_REQ_CACHE requests on a long-lived node. */
     uint16_t seen_reqs[FANET_REQ_CACHE];
-    uint8_t  seen_count;
+    uint8_t  seen_count;                 /* valid entries (caps at cache) */
+    uint8_t  seen_head;                  /* ring write cursor */
 
     /*
      * Reverse-path memory: while an RREQ floods forward, each node records
      * who it should send an RREP back to for a given request id. Keyed by
-     * req_id so concurrent discoveries don't collide.
+     * req_id so concurrent discoveries don't collide. Also a ring buffer.
      */
     uint16_t rev_req[FANET_REQ_CACHE];   /* req_id */
     uint8_t  rev_prev[FANET_REQ_CACHE];  /* previous hop for that req_id */
-    uint8_t  rev_count;
+    uint8_t  rev_count;                  /* valid entries (caps at cache) */
+    uint8_t  rev_head;                   /* ring write cursor */
 
     /* Routing table: dst -> next_hop, filled by RREP on the way back. */
     fanet_route_t routes[FANET_ROUTE_TABLE];
@@ -73,6 +95,10 @@ typedef struct fanet_node {
     uint8_t  route_complete;
 
     /* --- DATA statistics (for PDR) --- */
+    /* Known limitation: these are plain uint16_t counters and wrap silently
+     * after 65535 payloads, which would skew reported PDR on a very long run.
+     * They feed reporting only (never routing or trust), so this is left as a
+     * documented limitation rather than fixed. */
     uint16_t data_sent;      /* payloads this node originated */
     uint16_t data_received;  /* payloads that arrived here as final dest */
     uint16_t data_dropped;   /* payloads this node deliberately swallowed
@@ -81,12 +107,13 @@ typedef struct fanet_node {
     /* --- reputation of neighbours, learned from their behaviour --- */
     fanet_trust_t trust;
 
-    /* The packet we most recently handed to a neighbour and are now waiting
-     * to overhear it relay. Identified by (peer, dst, seq) so that only a
-     * genuine forward of THAT packet counts as evidence of good behaviour. */
-    uint8_t  pending_peer;   /* FANET_INVALID_ID when nothing is pending */
-    uint8_t  pending_dst;
-    uint16_t pending_seq;
+    /* Outstanding observations: packets we handed to neighbours and are now
+     * waiting to overhear them relay. Each is identified by (peer, dst, seq)
+     * so only a genuine forward of THAT packet counts as evidence. A small
+     * queue (not a single slot) lets a node track several in-flight packets
+     * without losing earlier observations and wrongly blaming honest relays. */
+    fanet_pending_t pending[FANET_PENDING_MAX];
+    uint8_t  pending_head;   /* ring cursor for evicting the oldest when full */
 } fanet_node_t;
 
 /* Initialize a node. */

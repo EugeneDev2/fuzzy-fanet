@@ -58,13 +58,60 @@ static int seen_before(fanet_node_t *n, uint16_t req_id) {
 }
 
 static void remember(fanet_node_t *n, uint16_t req_id) {
-    if (n->seen_count < FANET_REQ_CACHE)
-        n->seen_reqs[n->seen_count++] = req_id;
+    /* Ring buffer: overwrite the oldest entry once full instead of silently
+     * refusing to record. Loop protection must keep working forever, not just
+     * for the first FANET_REQ_CACHE requests. */
+    n->seen_reqs[n->seen_head] = req_id;
+    n->seen_head = (uint8_t)((n->seen_head + 1) % FANET_REQ_CACHE);
+    if (n->seen_count < FANET_REQ_CACHE) n->seen_count++;
 }
 
 static int path_contains(const fanet_packet_t *p, uint8_t id) {
     for (uint8_t i = 0; i < p->path_len; ++i)
         if (p->path[i] == id) return 1;
+    return 0;
+}
+
+/* ---- pending observations (who we're waiting to overhear relay) --------- */
+
+/*
+ * Arm an observation: we handed `peer` the DATA packet (dst, seq) and now
+ * wait to overhear it relay exactly that. Uses a free slot if one exists;
+ * if the queue is full, evict the oldest slot - and forgo the entrusting it
+ * held, because we simply stopped watching it and must not blame it for a
+ * packet we never got to observe.
+ */
+static void pending_arm(fanet_node_t *n, uint8_t peer,
+                        uint8_t dst, uint16_t seq) {
+    for (int i = 0; i < FANET_PENDING_MAX; ++i) {
+        if (n->pending[i].peer == FANET_INVALID_ID) {
+            n->pending[i].peer = peer;
+            n->pending[i].dst  = dst;
+            n->pending[i].seq  = seq;
+            return;
+        }
+    }
+    /* full: recycle the oldest slot, un-blaming whoever it was watching */
+    fanet_pending_t *slot = &n->pending[n->pending_head];
+    ft_on_forgo(&n->trust, slot->peer);
+    slot->peer = peer;
+    slot->dst  = dst;
+    slot->seq  = seq;
+    n->pending_head = (uint8_t)((n->pending_head + 1) % FANET_PENDING_MAX);
+}
+
+/* Close the observation matching (peer, dst, seq). Returns 1 if one was open
+ * (i.e. this really is a packet we entrusted to this peer), else 0. */
+static int pending_resolve(fanet_node_t *n, uint8_t peer,
+                           uint8_t dst, uint16_t seq) {
+    for (int i = 0; i < FANET_PENDING_MAX; ++i) {
+        if (n->pending[i].peer == peer &&
+            n->pending[i].dst  == dst  &&
+            n->pending[i].seq  == seq) {
+            n->pending[i].peer = FANET_INVALID_ID;   /* observed: close it */
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -76,11 +123,11 @@ static void remember_reverse(fanet_node_t *n, uint16_t req_id, uint8_t prev) {
     for (uint8_t i = 0; i < n->rev_count; ++i) {
         if (n->rev_req[i] == req_id) { n->rev_prev[i] = prev; return; }
     }
-    if (n->rev_count < FANET_REQ_CACHE) {
-        n->rev_req[n->rev_count]  = req_id;
-        n->rev_prev[n->rev_count] = prev;
-        n->rev_count++;
-    }
+    /* Ring buffer: overwrite the oldest entry when full (see remember()). */
+    n->rev_req[n->rev_head]  = req_id;
+    n->rev_prev[n->rev_head] = prev;
+    n->rev_head = (uint8_t)((n->rev_head + 1) % FANET_REQ_CACHE);
+    if (n->rev_count < FANET_REQ_CACHE) n->rev_count++;
 }
 
 /* Look up who to send the RREP back to for this req_id.
@@ -139,7 +186,10 @@ void fanet_node_init(fanet_node_t *n, uint8_t id, float x, float y,
     n->mode = mode;
     n->transport = transport;
     ft_init(&n->trust);
-    n->pending_peer = FANET_INVALID_ID;
+    /* memset above zeroed the pending slots, but peer id 0 is valid, so mark
+     * every slot explicitly empty. */
+    for (int i = 0; i < FANET_PENDING_MAX; ++i)
+        n->pending[i].peer = FANET_INVALID_ID;
 }
 
 void fanet_node_set_metrics(fanet_node_t *n, fanet_metrics_t m) {
@@ -156,7 +206,9 @@ void fanet_node_set_metrics(fanet_node_t *n, fanet_metrics_t m) {
  */
 void fanet_node_reset_cache(fanet_node_t *n) {
     n->seen_count = 0;
+    n->seen_head = 0;
     n->rev_count = 0;
+    n->rev_head = 0;
     n->route_complete = 0;
     n->found_len = 0;
     memset(n->routes, 0, sizeof(n->routes));   /* stale routes must go */
@@ -372,9 +424,7 @@ static void handle_data(fanet_node_t *n, const fanet_packet_t *pkt) {
     if (next != pkt->dst) {
         ft_on_entrusted(&n->trust, next);
         ft_update(&n->trust, next);
-        n->pending_peer = next;
-        n->pending_dst  = pkt->dst;
-        n->pending_seq  = pkt->seq;
+        pending_arm(n, next, pkt->dst, pkt->seq);
     }
 
     fanet_packet_t fwd = *pkt;
@@ -404,15 +454,13 @@ void fanet_node_on_overhear(fanet_node_t *listener,
     if (pkt->type != PKT_DATA) return;          /* only payload matters here */
     if (transmitter == listener->id) return;
 
-    /* Was this exact payload one we handed to this exact neighbour? */
-    if (listener->pending_peer != transmitter) return;
-    if (listener->pending_seq  != pkt->seq)    return;
-    if (listener->pending_dst  != pkt->dst)    return;
+    /* Was this exact payload one we handed to this exact neighbour? Closing
+     * the matching observation both confirms it and frees the slot. */
+    if (!pending_resolve(listener, transmitter, pkt->dst, pkt->seq)) return;
 
     /* Yes - it kept its word. */
     ft_on_forwarded(&listener->trust, transmitter);
     ft_update(&listener->trust, transmitter);
-    listener->pending_peer = FANET_INVALID_ID;   /* resolved */
 }
 
 int fanet_send_data(fanet_node_t *n, uint8_t dst,
@@ -437,9 +485,7 @@ int fanet_send_data(fanet_node_t *n, uint8_t dst,
     if (next != dst) {
         ft_on_entrusted(&n->trust, next);
         ft_update(&n->trust, next);
-        n->pending_peer = next;
-        n->pending_dst  = dst;
-        n->pending_seq  = seq;
+        pending_arm(n, next, dst, seq);
     }
 
     n->data_sent++;
@@ -455,6 +501,17 @@ int fanet_send_data(fanet_node_t *n, uint8_t dst,
  * behaviour (see fanet_trust.h and fanet_node_on_overhear).
  */
 void fanet_node_on_receive(fanet_node_t *n, const fanet_packet_t *pkt) {
+    /*
+     * Trust nothing about the length before touching path[]. path_len is
+     * attacker-controlled (a uint8_t, so up to 255) while path[] holds only
+     * FANET_MAX_PATH entries. A crafted or corrupted length would otherwise
+     * drive out-of-bounds reads in every handler that walks the path. Drop
+     * the packet outright rather than clamp: a truncated path would yield a
+     * bogus prev/next-hop and poison routing, so a bad length means a bad
+     * packet, full stop.
+     */
+    if (pkt->path_len > FANET_MAX_PATH) return;
+
     switch (pkt->type) {
         case PKT_RREQ: handle_rreq(n, pkt); break;
         case PKT_RREP: handle_rrep(n, pkt); break;

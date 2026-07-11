@@ -117,6 +117,12 @@ Two details keep this honest rather than trigger-happy:
   traffic keeps a trust of ~0.89 and is never blacklisted.
 - **Evidence threshold**: a neighbour must have been entrusted with several
   packets before it can be condemned. One missed packet convicts nobody.
+- **Per-packet observations**: each entrusted packet is tracked in its own
+  slot in a small queue, keyed by `(peer, dst, seq)`, not in a single shared
+  cell. A single cell wrongly blamed honest relays under concurrent traffic,
+  because a second forwarded packet overwrote the first before it was
+  overheard; the queue matches every overheard forward to the exact packet it
+  resolves.
 
 The result: 0 false accusations in the run above.
 

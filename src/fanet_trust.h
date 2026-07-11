@@ -47,6 +47,13 @@
  * willing to condemn it. Prevents convicting a neighbour on one lost packet. */
 #define FT_MIN_EVIDENCE 3
 
+/* Counter-scaling cap. entrusted/forwarded are uint16_t; on a long-lived node
+ * they would eventually overflow and corrupt the trust ratio. When entrusted
+ * reaches this cap we halve BOTH counters: the ratio is preserved, the
+ * overflow risk is reset, and recent behaviour naturally gains weight over
+ * ancient history. */
+#define FT_EVIDENCE_CAP 1000
+
 typedef enum {
     FT_OK = 0,        /* behaving */
     FT_WATCHED = 1,   /* suspicious, still allowed */
@@ -74,6 +81,14 @@ void ft_on_entrusted(fanet_trust_t *t, uint8_t peer);
 
 /* Record that we overheard `peer` actually forwarding a packet. */
 void ft_on_forwarded(fanet_trust_t *t, uint8_t peer);
+
+/*
+ * Cancel a previously recorded entrusting that we never got to observe (e.g.
+ * the observation slot was recycled before we could overhear the relay).
+ * Rolls back the entrusted count so the peer is NOT blamed for a packet we
+ * simply stopped watching - silence we chose to ignore is not evidence.
+ */
+void ft_on_forgo(fanet_trust_t *t, uint8_t peer);
 
 /*
  * Recompute `peer`'s reputation from observed behaviour and update its

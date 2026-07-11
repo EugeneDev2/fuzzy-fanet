@@ -37,6 +37,13 @@ static ft_peer_t *get_or_add(fanet_trust_t *t, uint8_t peer) {
             return p;
         }
     }
+    /*
+     * Known limitation: the peer table is full (FT_MAX_PEERS neighbours).
+     * We return NULL and callers skip the update, so a Black Hole that only
+     * ever appears beyond the 32nd tracked neighbour would go unwatched.
+     * Acceptable here (a node rarely has that many active neighbours); a
+     * production build would evict the least-recently-seen peer instead.
+     */
     return 0;   /* table full: cannot track this peer */
 }
 
@@ -48,12 +55,26 @@ void ft_init(fanet_trust_t *t) {
 
 void ft_on_entrusted(fanet_trust_t *t, uint8_t peer) {
     ft_peer_t *p = get_or_add(t, peer);
-    if (p) p->entrusted++;
+    if (!p) return;
+    p->entrusted++;
+
+    /* Keep the uint16_t counters from ever overflowing: at the cap, halve
+     * both. The forwarded/entrusted ratio is preserved (so trust is
+     * unchanged), while fresh observations now weigh more than old ones. */
+    if (p->entrusted >= FT_EVIDENCE_CAP) {
+        p->entrusted = (uint16_t)(p->entrusted / 2);
+        p->forwarded = (uint16_t)(p->forwarded / 2);
+    }
 }
 
 void ft_on_forwarded(fanet_trust_t *t, uint8_t peer) {
     ft_peer_t *p = get_or_add(t, peer);
     if (p) p->forwarded++;
+}
+
+void ft_on_forgo(fanet_trust_t *t, uint8_t peer) {
+    ft_peer_t *p = find_peer(t, peer);
+    if (p && p->entrusted > 0) p->entrusted--;
 }
 
 void ft_update(fanet_trust_t *t, uint8_t peer) {
