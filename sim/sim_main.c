@@ -102,14 +102,32 @@ static void run_mode(const char *label, fanet_mode_t mode) {
     else
         printf("  <<< route clean\n");
 
-    /* proof that RREP built a routing table: source knows its next hop,
-     * and so does the destination (reverse route). */
-    uint8_t nh_fwd = fanet_next_hop(src, dst->id);
-    uint8_t nh_rev = fanet_next_hop(dst, src->id);
-    printf("  routing table: node %d -> next hop %d toward %d",
-           src->id, nh_fwd, dst->id);
-    printf(" | node %d -> next hop %d toward %d\n", dst->id, nh_rev, src->id);
-    printf("\n");
+    /* --- now actually push data along the route the RREP built --- */
+    const int BURST = 100;
+    const uint8_t payload[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    int refused = 0;
+
+    for (int i = 0; i < BURST; ++i) {
+        if (!fanet_send_data(src, dst->id, payload, 4, (uint16_t)i))
+            refused++;          /* fail-safe: source had no route */
+        vnet_pump(FANET_INVALID_ID);   /* deliver until the network settles */
+    }
+
+    int delivered = dst->data_received;
+    float pdr = 100.0f * (float)delivered / (float)BURST;
+
+    /* where did the rest die? separate malice from physics. */
+    int swallowed = 0;
+    for (int i = 0; i < N; ++i)
+        if (nodes[i].is_malicious) swallowed += nodes[i].data_dropped;
+    int lost_radio = BURST - delivered - swallowed - refused;
+    if (lost_radio < 0) lost_radio = 0;
+
+    printf("  data: sent %d | delivered %d | PDR %.1f%%\n", BURST, delivered, pdr);
+    printf("  losses: %d swallowed by attackers | %d lost on radio",
+           swallowed, lost_radio);
+    if (refused) printf(" | %d refused (no route)", refused);
+    printf("\n\n");
 }
 
 int main(void) {

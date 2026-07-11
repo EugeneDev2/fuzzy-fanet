@@ -289,6 +289,71 @@ static void handle_rreq(fanet_node_t *n, const fanet_packet_t *pkt) {
     n->transport->send(n, FANET_INVALID_ID, &fwd);
 }
 
+/* ---- DATA: payload forwarding along the routing table ------------------ */
+
+/*
+ * Handle a DATA packet.
+ *
+ * This is where a Black Hole finally does damage. During route discovery it
+ * only had to look attractive; now that it sits on the path, it simply
+ * swallows every payload instead of forwarding it. That is the whole attack:
+ * the route looks fine, the data never arrives.
+ *
+ * An honest node either consumes the payload (if it is the destination) or
+ * forwards it one hop closer using the routing table the RREP built.
+ */
+static void handle_data(fanet_node_t *n, const fanet_packet_t *pkt) {
+    /* am I the destination? deliver it. */
+    if (n->id == pkt->dst) {
+        n->data_received++;
+        return;
+    }
+
+    /* --- the attack --- */
+    if (n->is_malicious) {
+        n->data_dropped++;   /* swallowed, never forwarded */
+        return;
+    }
+
+    if (pkt->ttl == 0) {
+        n->data_dropped++;
+        return;
+    }
+
+    /* forward one hop closer, per the routing table */
+    uint8_t next = fanet_next_hop(n, pkt->dst);
+    if (next == FANET_INVALID_ID) {
+        n->data_dropped++;   /* no route: drop rather than flood */
+        return;
+    }
+
+    fanet_packet_t fwd = *pkt;
+    fwd.ttl = (uint8_t)(pkt->ttl - 1);
+    n->transport->send(n, next, &fwd);
+}
+
+int fanet_send_data(fanet_node_t *n, uint8_t dst,
+                    const uint8_t *payload, uint8_t len, uint16_t seq) {
+    uint8_t next = fanet_next_hop(n, dst);
+    if (next == FANET_INVALID_ID)
+        return 0;   /* fail-safe: no route, don't send into the dark */
+
+    fanet_packet_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PKT_DATA;
+    pkt.src  = n->id;
+    pkt.dst  = dst;
+    pkt.ttl  = 15;
+    pkt.seq  = seq;
+
+    if (len > FANET_PAYLOAD) len = FANET_PAYLOAD;
+    if (payload && len) memcpy(pkt.payload, payload, len);
+
+    n->data_sent++;
+    n->transport->send(n, next, &pkt);
+    return 1;
+}
+
 /*
  * Transport entry point. Dispatches by packet type.
  *
@@ -303,7 +368,8 @@ void fanet_node_on_receive(fanet_node_t *n, const fanet_packet_t *pkt) {
     switch (pkt->type) {
         case PKT_RREQ: handle_rreq(n, pkt); break;
         case PKT_RREP: handle_rrep(n, pkt); break;
-        default: break;   /* HELLO / DATA handled elsewhere */
+        case PKT_DATA: handle_data(n, pkt); break;
+        default: break;   /* HELLO handled elsewhere */
     }
 }
 

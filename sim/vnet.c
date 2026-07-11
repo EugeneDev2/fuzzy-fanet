@@ -59,8 +59,13 @@ static void q_push(fanet_node_t *to, const fanet_packet_t *pkt) {
  * Deliver a packet. If dst == FANET_INVALID_ID: broadcast to all in-range
  * neighbors (used by RREQ flood) - lossy, models fading/collisions on a
  * shared broadcast frame. Otherwise: unicast to that specific in-range node
- * (used by RREP) - reliable, because real unicast (ESP-NOW / addressed LoRa)
- * carries link-layer ACK + retransmit, so a single fade doesn't drop it.
+ * (used by RREP and DATA).
+ *
+ * Unicast is far more reliable than broadcast because real link layers
+ * (ESP-NOW, addressed LoRa) retry on missing ACK - but not infallible: the
+ * retry budget is finite, so a small residual loss remains, larger at the
+ * edge of range. Modelling it as perfectly lossless would flatter the
+ * protocol with an unrealistic 100% PDR.
  */
 static void vnet_send(fanet_node_t *self, uint8_t dst,
                       const fanet_packet_t *pkt) {
@@ -74,12 +79,12 @@ static void vnet_send(fanet_node_t *self, uint8_t dst,
         float d = vdist(self, nb);
         if (d <= 0.0f || d > VNET_RANGE) continue;
 
-        if (is_broadcast) {
-            /* lossy shared medium */
-            float p_success = (d < VNET_RANGE * 0.7f) ? 0.98f : 0.70f;
-            if (vnet_rand() > p_success) continue;
-        }
-        /* unicast: reliable (ACK+retransmit) -> always delivered in range */
+        int near = (d < VNET_RANGE * 0.7f);
+        float p_success = is_broadcast
+                        ? (near ? 0.98f : 0.70f)   /* shared medium, lossy */
+                        : (near ? 0.995f : 0.97f); /* unicast w/ ACK+retry */
+
+        if (vnet_rand() > p_success) continue;   /* lost despite retries */
 
         q_push(nb, pkt);
     }

@@ -30,10 +30,10 @@ Membership functions and all 27 rules transcribed directly from the original
 **Routing layer** (`src/fanet_routing.{c,h}`) — Fuzzy-AODV ported from the
 MATLAB `RoutingProtocol.m`: RREQ flooding, per-node metric normalization,
 fuzzy reliability scoring, the 0.4 forwarding gate, loop/duplicate protection,
-TTL, a Black Hole trust filter, and **RREP** — the destination replies the
-route back to the source and every hop builds a routing table (`dst -> next
-hop`). Talks only to a transport interface, so the same code runs over the PC
-sim today and ESP-NOW / LoRa later.
+TTL, a Black Hole trust filter, **RREP** (the destination replies the route
+back, and every hop builds a `dst -> next hop` table), and **DATA** forwarding
+along that table with PDR accounting. Talks only to a transport interface, so
+the same code runs over the PC sim today and ESP-NOW / LoRa later.
 
 **Transport seam** (`src/fanet_transport.h`) — the one interface that lets the
 radio backend be swapped without touching routing.
@@ -53,9 +53,6 @@ make test    # unit-test the fuzzy core
 make sim     # run the Standard vs Fuzzy Black Hole experiment
 ```
 
-> **Windows:** build from PowerShell (with MSYS2 `make`/`gcc` in PATH), not
-> Git Bash — MSYS2 make conflicts with Git Bash's own `msys-2.0.dll`.
-
 Example simulation output (50 nodes, ~15% Black Holes, source & destination in
 opposite corners):
 
@@ -63,18 +60,23 @@ opposite corners):
 === STANDARD AODV (blind) ===
   path: 0 -> 27(!) -> 21 -> 3 -> 8 -> 9(!) -> 28 -> 4 -> 49
   hops: 8 | attackers in route: 2   <<< BLACK HOLE IN PATH
-  routing table: node 0 -> next hop 27 toward 49 | node 49 -> next hop 4 toward 0
+  data: sent 100 | delivered 0 | PDR 0.0%
+  losses: 97 swallowed by attackers | 3 lost on radio
 
 === FUZZY AODV (trust filter) ===
   path: 0 -> 44 -> 7 -> 15 -> 29 -> 6 -> 25 -> 4 -> 49
   hops: 8 | attackers in route: 0   <<< route clean
-  routing table: node 0 -> next hop 44 toward 49 | node 49 -> next hop 4 toward 0
+  data: sent 100 | delivered 88 | PDR 88.0%
+  losses: 0 swallowed by attackers | 12 lost on radio
 ```
 
-`(!)` marks a Black Hole node. Standard AODV is lured through two attackers
-and its routing table points straight at one (`next hop 27` = a Black Hole);
-Fuzzy-AODV routes around all of them. The RREP travels back from destination
-to source, so both ends end up with a next-hop route — ready to carry data.
+`(!)` marks a Black Hole. Standard AODV is lured through two attackers, and
+its very first hop swallows the traffic — **not a single payload arrives**.
+Fuzzy-AODV filters them out during discovery, so the route carries data: the
+only losses left are ordinary radio fades across 8 hops, not malice.
+
+That split matters. The protocol does not claim to beat physics — it claims
+to remove the attacker. The loss breakdown makes the difference explicit.
 
 ## Use the fuzzy core directly
 
@@ -112,14 +114,18 @@ Still to do:
       source; every hop builds a routing table (dst -> next hop), so the
       source knows who to send data to. Unicast RREP is modelled as reliable
       (link-layer ACK), broadcast RREQ as lossy.
-- [ ] **DATA packets**: actually forward payload along the routing table the
-      RREP built, and measure end-to-end delivery (PDR).
+- [x] **DATA packets**: payload is forwarded hop-by-hop along the routing
+      table the RREP built, and end-to-end delivery (PDR) is measured. A
+      Black Hole now actually bites: it silently swallows every payload it is
+      trusted to forward.
+- [ ] **Real TrustManager**: direct trust from observed behaviour — count how
+      many payloads a neighbour was given versus how many it actually
+      forwarded, decay its reputation, watchlist, then blacklist. This
+      replaces the sim's ground-truth sentinel with genuine detection.
+      *(Described in the thesis; never implemented in the original code,
+      which only had an `IsMalicious` flag.)*
 - [ ] **ESP32-C3 target**: flash the core, broadcast HELLO with live metrics
       over the radio (ESP-NOW first, LoRa later).
-- [ ] **Real TrustManager**: direct + indirect trust, watchlist/blacklist,
-      behavioral Black Hole detection — replacing the sim's ground-truth
-      sentinel. *(Described in the thesis; never implemented in the original
-      code, which only had an `IsMalicious` flag.)*
 - [ ] **Async simulation**: per-node timers / event loop instead of the
       synchronous flood, to mirror real radio timing.
 - [ ] **Multi-hop swarm demo** on 3–5 boards + a short capture/video.

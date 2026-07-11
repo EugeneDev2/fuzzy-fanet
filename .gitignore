@@ -4,8 +4,6 @@ test_fuzzy
 *.out
 *.elf
 *.bin
-*.exe
-*.dll
 build/
 .pio/
 .vscode/

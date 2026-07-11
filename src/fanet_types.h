@@ -21,7 +21,8 @@
 typedef enum {
     PKT_RREQ = 1,   /* route request  (flood) */
     PKT_RREP = 2,   /* route reply    (unicast back) */
-    PKT_HELLO = 3   /* neighbor discovery / metric beacon */
+    PKT_HELLO = 3,  /* neighbor discovery / metric beacon */
+    PKT_DATA = 4    /* payload, forwarded hop-by-hop via routing table */
 } fanet_pkt_type_t;
 
 /*
@@ -35,6 +36,10 @@ typedef struct {
     uint8_t  speed_max;     /* max speed, m/s */
     int8_t   snr_db;        /* link SNR in dB (signed) */
 } fanet_metrics_t;
+
+/* DATA payload size. Deliberately small: a LoRa frame at a high spreading
+ * factor carries very little, so the protocol must stay frugal. */
+#define FANET_PAYLOAD 16
 
 /*
  * Routing packet. Fixed layout; `path` is a fixed array with `path_len`
@@ -51,6 +56,10 @@ typedef struct {
     uint8_t  path_len;                /* number of valid entries in path[] */
     uint8_t  path[FANET_MAX_PATH];    /* node ids visited, in order */
     fanet_metrics_t sender;           /* sender's raw metrics (for scoring) */
+
+    /* --- DATA only --- */
+    uint16_t seq;                     /* payload sequence number (for PDR) */
+    uint8_t  payload[FANET_PAYLOAD];  /* the actual bytes being delivered */
 } fanet_packet_t;
 
 #endif /* FANET_TYPES_H */

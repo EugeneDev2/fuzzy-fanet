@@ -70,6 +70,12 @@ typedef struct fanet_node {
     uint8_t  found_path[FANET_MAX_PATH];
     uint8_t  found_len;
     uint8_t  route_complete;
+
+    /* --- DATA statistics (for PDR) --- */
+    uint16_t data_sent;      /* payloads this node originated */
+    uint16_t data_received;  /* payloads that arrived here as final dest */
+    uint16_t data_dropped;   /* payloads this node deliberately swallowed
+                              * (Black Hole) or had to discard (no route) */
 } fanet_node_t;
 
 /* Initialize a node. */
@@ -102,5 +108,15 @@ void fanet_node_reset_cache(fanet_node_t *n);
  * This is what a DATA packet would consult to move one hop closer.
  */
 uint8_t fanet_next_hop(const fanet_node_t *n, uint8_t dst);
+
+/*
+ * Send a DATA payload toward `dst`, using the routing table built by the
+ * RREP. Returns 1 if the packet was handed to the transport, 0 if no route
+ * is known (fail-safe: nothing is sent into the dark).
+ *
+ * The payload is copied; `len` is clamped to FANET_PAYLOAD.
+ */
+int fanet_send_data(fanet_node_t *n, uint8_t dst,
+                    const uint8_t *payload, uint8_t len, uint16_t seq);
 
 #endif /* FANET_ROUTING_H */
